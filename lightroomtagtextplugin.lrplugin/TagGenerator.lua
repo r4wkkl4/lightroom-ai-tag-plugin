@@ -11,7 +11,7 @@ local LrFunctionContext = import 'LrFunctionContext'
 local LrProgressScope = import 'LrProgressScope'
 local LrLogger = import 'LrLogger'
 
-local logger = LrLogger('AltTextPlugin')
+local logger = LrLogger('TagTextPlugin')
 logger:enable("logfile")
 
 local configPath = LrPathUtils.child(_PLUGIN.path, 'config.lua')
@@ -39,8 +39,8 @@ local function resizePhoto(photo, progressScope)
         LR_minimizeEmbeddedMetadata = true,
         LR_outputSharpeningOn = false,
         LR_size_doConstrain = true,
-        LR_size_maxHeight = 2000,
-        LR_size_maxWidth = 2000,
+        LR_size_maxHeight = 1024,--2000,
+        LR_size_maxWidth = 1024,
         LR_size_resizeType = 'wh',
         LR_size_units = 'pixels',
     }
@@ -74,29 +74,43 @@ local function encodePhotoToBase64(filePath, progressScope)
     return LrStringUtils.encodeBase64(data)
 end
 
-local function requestAltTextFromOpenAI(imageBase64, progressScope)
-    progressScope:setCaption("Requesting alt text from OpenAI...")
-    local apiKey = prefs.openaiApiKey
+local function requestTagsFromAI(imageBase64, progressScope)
+    progressScope:setCaption("Requesting tag text from API...")
+    local apiKey = prefs.apiKey --config.API_KEY
     if not apiKey then
-        LrDialogs.message("Your OpenAI API key is missing. Please set it up in the plugin manager.")
+        LrDialogs.message("Your API key is missing. Please set it up in the plugin manager.")
+        return nil
+    end
+    local apiUrl = prefs.apiUrl
+    if not apiUrl then
+        LrDialogs.message("Your API URL is missing. Please set it up in the plugin manager.")
+        return nil
+    end
+    local modelName = prefs.modelName
+    if not modelName then
+        LrDialogs.message("Your Model Name is missing. Please set it up in the plugin manager.")
         return nil
     end
 
-    local url = "https://api.openai.com/v1/responses"
+    local url = apiUrl .. "/responses"
     local headers = {
         { field = "Content-Type", value = "application/json" },
         { field = "Authorization", value = "Bearer " .. apiKey },
     }
 
     local body = {
-        model = "gpt-5.1",
-        store = false,
-        instructions = config.INSTRUCTIONS,
-        user = "lightroom-plugin",
+        model = modelName,--config.MODEL,
+--        store = false,
+--        instructions = config.INSTRUCTIONS,
+--        user = "lightroom-plugin",
         input = {
             {
                 role = "user",
                 content = {
+                    {
+                        type = "input_text",
+                        text = config.INSTRUCTIONS
+                    },
                     {
                         type = "input_image",
                         image_url = "data:image/jpeg;base64," .. imageBase64
@@ -107,13 +121,13 @@ local function requestAltTextFromOpenAI(imageBase64, progressScope)
         text = {
             format = {
                 type = "json_schema",
-                name = "alt_text",
+                name = "tag_text",
                 schema = {
                     type = "object",
                     properties = {
-                        altText = { type = "string" }
+                        tagText = { type = "string" }
                     },
-                    required = { "altText" },
+                    required = { "tagText" },
                     additionalProperties = false
                 }
             }
@@ -124,21 +138,21 @@ local function requestAltTextFromOpenAI(imageBase64, progressScope)
     local response, _ = LrHttp.post(url, bodyJson, headers)
 
     if not response then
-        LrDialogs.message("No response from OpenAI. Please try again.")
+        LrDialogs.message("No response from AI API. Please try again.")
         return nil
     end
 
     local ok, decoded = pcall(json.decode, response)
     if not ok then
-        logger:trace("Failed to parse OpenAI response: " .. tostring(response))
-        LrDialogs.message("Invalid response from OpenAI.")
+        logger:trace("Failed to parse API response: " .. tostring(response))
+        LrDialogs.message("Invalid response from API.")
         return nil
     end
 
     -- Check for API error
     if decoded.error and decoded.error.message then
-        logger:trace("OpenAI API error:\n" .. json.encode(decoded, { indent = true }))
-        LrDialogs.message("OpenAI error: " .. decoded.error.message)
+        logger:trace("API error:\n" .. json.encode(decoded, { indent = true }))
+        LrDialogs.message("API error: " .. decoded.error.message)
         return nil
     end
 
@@ -146,15 +160,30 @@ local function requestAltTextFromOpenAI(imageBase64, progressScope)
     local outputs = decoded.output or {}
     for _, output in ipairs(outputs) do
         if output.role == "assistant" and output.content and output.content[1] and output.content[1].text then
-            return json.decode(output.content[1].text)
+            return output.content[1].text
         end
     end
 
-    LrDialogs.message("OpenAI returned an unexpected response.")
+    LrDialogs.message("API returned an unexpected response.")
     return nil
 end
 
-local function generateAltTextForPhoto(photo, progressScope)
+-- Check if val is empty or nil
+-- Taken from https://github.com/midzelis/mi.Immich.Publisher/blob/main/Utils.lua
+local function trim(s)
+    return s:match("^%s*(.-)%s*$")
+end
+
+--Taken from https://github.com/CommRogue/lrc-ai-assistant/blob/main/lrc-ai-assistant.lrplugin/Util.lua
+local function string_split(s, delimiter)
+    local t = {}
+    for str in string.gmatch(s, "([^" .. delimiter .. "]+)") do
+        table.insert(t, trim(str))
+    end
+    return t
+end
+
+local function generateTagsForPhoto(photo, progressScope)
     local resizedFilePath = resizePhoto(photo, progressScope)
     if not resizedFilePath then
         return false
@@ -167,14 +196,18 @@ local function generateAltTextForPhoto(photo, progressScope)
 
     LrFileUtils.delete(resizedFilePath)
 
-    local response = requestAltTextFromOpenAI(base64Image, progressScope)
+    local response = requestTagsFromAI(base64Image, progressScope)
 
-    if response and response.altText then
-        local altText = response.altText
-        photo.catalog:withWriteAccessDo("Set Alt Text", function()
-            photo:setRawMetadata('caption', altText)
+    if response then 
+        local ai_tags = response
+        photo.catalog:withWriteAccessDo("Set Keyword", function()
+            tags_list = string_split(ai_tags, ',')
+            for i, tag in next, tags_list do
+                keyword = photo.catalog:createKeyword(tag, {}, true, nil, true)
+                photo:addKeyword(keyword)
+            end
         end)
-        LrDialogs.showBezel("Alt text generated and saved to caption.")
+        LrDialogs.showBezel("Tags generated and saved to keywords.")
         return true
     end
 
@@ -182,7 +215,7 @@ local function generateAltTextForPhoto(photo, progressScope)
 end
 
 LrTasks.startAsyncTask(function()
-    LrFunctionContext.callWithContext("GenerateAltText", function(context)
+    LrFunctionContext.callWithContext("GenerateTags", function(context)
         local catalog = LrApplication.activeCatalog()
         local selectedPhotos = catalog:getTargetPhotos()
 
@@ -192,13 +225,13 @@ LrTasks.startAsyncTask(function()
         end
 
         local progressScope = LrProgressScope({
-            title = "Generating Alt Text",
+            title = "Generating Tags",
             functionContext = context,
         })
 
         for i, photo in ipairs(selectedPhotos) do
             progressScope:setPortionComplete(i - 1, #selectedPhotos)
-            if not generateAltTextForPhoto(photo, progressScope) then
+            if not generateTagsForPhoto(photo, progressScope) then
                 break
             end
             progressScope:setPortionComplete(i, #selectedPhotos)
